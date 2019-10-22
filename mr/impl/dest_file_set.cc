@@ -119,6 +119,7 @@ class CompressHandle : public DestHandle {
   fibers::fiber write_fiber_;
   std::atomic_int fiber_state_{0};
   ::file::WriteFile* gcs_file_ = nullptr;
+  bool is_gcs_ = false;
 };
 
 class LstHandle : public DestHandle {
@@ -181,15 +182,12 @@ void CompressHandle::AppendThreadLocal(const std::string& str) {
 }
 
 void CompressHandle::Open() {
-  if (owner_->is_gcs_dest()) {
-    size_t index = queue_index_ % owner_->io_pool()->size();
+  is_gcs_ = IsGcsPath(full_path_);
+  size_t index = queue_index_ % owner_->io_pool()->size();
 
-    IoContext& io_context = owner_->io_pool()->at(index);
-    out_queue_.reset(new fibers_ext::FiberQueue(32));
-    write_fiber_ = io_context.LaunchFiber([this, &io_context] { GcsWriteFiber(&io_context); });
-  } else {
-    OpenLocalFile();
-  }
+  IoContext& io_context = owner_->io_pool()->at(index);
+  out_queue_.reset(new fibers_ext::FiberQueue(32));
+  write_fiber_ = io_context.LaunchFiber([this, &io_context] { GcsWriteFiber(&io_context); });
 }
 
 void CompressHandle::GcsWriteFiber(IoContext* io_context) {
@@ -200,30 +198,36 @@ void CompressHandle::GcsWriteFiber(IoContext* io_context) {
 
   static thread_local asio::ssl::context ssl_context = GCE::CheckedSslContext();
 
-  if (FLAGS_local_runner_gcs_write_v2) {
-    gcs_file_ =
-        CHECKED_GET(OpenGcsWriteFile(full_path_, *owner_->gce(), owner_->GetGceApiPool()));
-    CHECK(gcs_file_);
-  } else {
-    absl::string_view bucket, path;
-    CHECK(GCS::SplitToBucketPath(full_path_, &bucket, &path));
+  if (is_gcs_) {
+    if (FLAGS_local_runner_gcs_write_v2) {
+      gcs_file_ =
+          CHECKED_GET(OpenGcsWriteFile(full_path_, *owner_->gce(), owner_->GetGceApiPool()));
+      CHECK(gcs_file_);
+    } else {
+      absl::string_view bucket, path;
+      CHECK(GCS::SplitToBucketPath(full_path_, &bucket, &path));
 
-    gcs_.reset(new util::GCS(*owner_->gce(), &ssl_context, io_context));
-    CHECK_STATUS(gcs_->Connect(FLAGS_gcs_connect_deadline_ms));
-    CHECK_STATUS(gcs_->OpenForWrite(bucket, path));
+      gcs_.reset(new util::GCS(*owner_->gce(), &ssl_context, io_context));
+      CHECK_STATUS(gcs_->Connect(FLAGS_gcs_connect_deadline_ms));
+      CHECK_STATUS(gcs_->OpenForWrite(bucket, path));
+    }
+  } else {
+    OpenLocalFile();
   }
 
   fiber_state_ = 1;
 
   out_queue_->Run();
 
-  // TODO: to handle abort_write by changing WriteFile interface to allow optionally drop
-  // the pending writes.
-  if (FLAGS_local_runner_gcs_write_v2) {
-    CHECK(gcs_file_->Close());
-    gcs_file_ = nullptr;
+  if (is_gcs_) {
+    // TODO: to handle abort_write by changing WriteFile interface to allow optionally drop
+    // the pending writes.
+    if (FLAGS_local_runner_gcs_write_v2) {
+      CHECK(gcs_file_->Close());
+      gcs_file_ = nullptr;
+    }
+    gcs_.reset();
   }
-  gcs_.reset();
 }
 
 // CompressHandle::Write runs in "other" threads, no necessarily where we write the data into.
@@ -248,36 +252,35 @@ void CompressHandle::Write(StringGenCb cb) {
       start_delta_ = 0;
     }
 
-    if (out_queue_) {
-      auto start = base::GetMonotonicMicrosFast();
-      auto fiber_state = fiber_state_.load(std::memory_order_relaxed);
+    auto start = base::GetMonotonicMicrosFast();
+    auto fiber_state = fiber_state_.load(std::memory_order_relaxed);
 
-      auto cb = [start, this, str = std::move(*tmp_str)] {
-        dest_files.IncBy("gcs-deque", base::GetMonotonicMicrosFast() - start);
+    auto cb = [start, this, str = std::move(*tmp_str)] {
+      dest_files.IncBy("gcs-deque", base::GetMonotonicMicrosFast() - start);
+      if (is_gcs_) {
         if (FLAGS_local_runner_gcs_write_v2) {
-          CHECK_STATUS(write_file_->Write(str));
+          CHECK_STATUS(gcs_file_->Write(str));
         } else {
           CHECK_STATUS(gcs_->Write(strings::ToByteRange(str)));
         }
-      };
-
-      bool preempted = out_queue_->Add(std::move(cb));
-
-      auto delta = base::GetMonotonicMicrosFast() - start;
-      if (preempted) {
-        if (fiber_state == 1) {
-          dest_files.IncBy("gcs-submit-preempted", delta);
-        } else {
-          dest_files.IncBy("gcs-submit-launching", delta);
-        }
-      } else {  // if(out_queue_)
-        dest_files.IncBy("gcs-submit-fast", delta);
+      } else {
+        owner_->pool()->Add(queue_index_, [this, str = std::move(str)] { AppendThreadLocal(str); });
       }
-      this_fiber::yield();
+    };
+
+    bool preempted = out_queue_->Add(std::move(cb));
+
+    auto delta = base::GetMonotonicMicrosFast() - start;
+    if (preempted) {
+      if (fiber_state == 1) {
+        dest_files.IncBy("gcs-submit-preempted", delta);
+      } else {
+        dest_files.IncBy("gcs-submit-launching", delta);
+      }
     } else {
-      owner_->pool()->Add(queue_index_,
-                          [this, str = std::move(*tmp_str)] { AppendThreadLocal(str); });
+      dest_files.IncBy("gcs-submit-fast", delta);
     }
+    this_fiber::yield();
   }
 }
 
@@ -290,37 +293,41 @@ void CompressHandle::Close(bool abort_write) {
 
       auto& buf = compress_out_buf_->contents();
       if (!buf.empty()) {
-        // Flush the rest of compressed data.
-        if (out_queue_) {  // GCS flow.
-          out_queue_->Add([this, str = std::move(buf)] {
+        auto cb = [this, str = std::move(buf)] {
+          if (is_gcs_) {
             if (FLAGS_local_runner_gcs_write_v2) {
               CHECK_STATUS(gcs_file_->Write(str));
             } else {
               CHECK_STATUS(gcs_->Write(strings::ToByteRange(str)));
             }
-          });
-        } else {
-          owner_->pool()->Add(queue_index_,
-                              [this, str = std::move(buf)] { AppendThreadLocal(str); });
-        }
+          } else {
+            owner_->pool()->Add(queue_index_,
+                                [this, str = std::move(str)] { AppendThreadLocal(str); });
+          }
+        };
+        out_queue_->Add(std::move(cb));
       }
     }
   }
 
-  if (out_queue_) {
-    // Send GCS closure callback and signal the queue to finish file but do not block on it.
-    if (FLAGS_local_runner_gcs_write_v2) {
-      // TODO: to handle abort_write by changing WriteFile interface to allow optionally drop
-      // the pending writes. We close inside GcsWriteFiber.
+  auto cb = [this, abort_write] {
+    if (is_gcs_) {
+      // Send GCS closure callback and signal the queue to finish file but do not block on it.
+      if (FLAGS_local_runner_gcs_write_v2) {
+        // TODO: to handle abort_write by changing WriteFile interface to allow optionally drop
+        // the pending writes. We close inside GcsWriteFiber.
+      } else {
+        CHECK_STATUS(gcs_->CloseWrite(abort_write));
+      }
     } else {
-      out_queue_->Add([this, abort_write] { CHECK_STATUS(gcs_->CloseWrite(abort_write)); });
+      CloseWriteFile(abort_write);
     }
+  };
 
-    /// Notifies but does not block for shutdown. We block when waiting for GcsWriteFiber to exit.
-    out_queue_->Shutdown();
-  } else {
-    CloseWriteFile(abort_write);
-  }
+  out_queue_->Add(std::move(cb));
+
+  /// Notifies but does not block for shutdown. We block when waiting for GcsWriteFiber to exit.
+  out_queue_->Shutdown();
 }
 
 LstHandle::LstHandle(DestFileSet* owner, const ShardId& sid) : DestHandle(owner, sid) {}
